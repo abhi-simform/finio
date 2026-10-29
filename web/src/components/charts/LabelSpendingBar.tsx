@@ -1,0 +1,69 @@
+import { useMemo } from 'react';
+import { useFinanceStore } from '@/store/useFinanceStore';
+import { formatCurrency } from '@/utils/formatters';
+import type { Transaction } from '@/types';
+
+interface Props {
+  transactions: Transaction[];
+}
+
+export function LabelSpendingBar({ transactions }: Props) {
+  const labels = useFinanceStore((s) => s.labels);
+  const hideAmounts = useFinanceStore((s) => s.settings.hideAmounts);
+
+  const data = useMemo(() => {
+    const byLabel = new Map<string, number>();
+
+    for (const tx of transactions.filter((t) => t.type === 'expense')) {
+      for (const labelId of tx.labels) {
+        byLabel.set(labelId, (byLabel.get(labelId) ?? 0) + tx.amount);
+      }
+    }
+
+    return Array.from(byLabel.entries())
+      .map(([labelId, amount]) => {
+        const label = labels.find((l) => l.id === labelId);
+        return {
+          name: label?.name ?? 'Unknown',
+          amount,
+          color: label?.color ?? 'var(--muted-foreground)',
+        };
+      })
+      .sort((a, b) => b.amount - a.amount)
+      .slice(0, 6);
+  }, [transactions, labels]);
+
+  if (data.length === 0) return null;
+
+  return (
+    <div className="card-elevated rounded-md p-4">
+      <h3 className="mb-3 text-sm font-semibold">Spending by label</h3>
+      {/* The amount is already spelled out next to every label, so the bars are decorative. */}
+      <ul className="space-y-2">
+        {data.map((item) => {
+          const maxAmount = data[0]?.amount ?? 1;
+          const width = (item.amount / maxAmount) * 100;
+          return (
+            <li key={item.name} className="space-y-1">
+              <div className="flex justify-between text-xs">
+                <span className="text-muted-foreground">{item.name}</span>
+                <span className="font-medium">
+                  {formatCurrency(item.amount, true, hideAmounts)}
+                </span>
+              </div>
+              <div aria-hidden className="bg-muted h-2 overflow-hidden rounded-full">
+                <div
+                  className="h-full rounded-full transition-all"
+                  style={{
+                    width: `${width}%`,
+                    backgroundColor: item.color,
+                  }}
+                />
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}

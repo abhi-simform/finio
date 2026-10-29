@@ -1,0 +1,766 @@
+import { useState, useMemo, useRef, useCallback } from 'react';
+import { useNavigate, useParams, useSearchParams } from 'react-router';
+import { ArrowLeft, Trash2, Split, Plus, X, Wand2 } from 'lucide-react';
+import { CategoryIcon } from '@/components/categories/CategoryIcon';
+import { CategoryGrid } from '@/components/categories/CategoryGrid';
+import { toast } from 'sonner';
+import { useFinanceStore } from '@/store/useFinanceStore';
+import { roundMoney } from '@/store/balance';
+import { findMatchingRule, mergeLabels } from '@/utils/autoCategorize';
+import { findTransferCategory, isCategoryValidForType, miscLast } from '@/utils/calculations';
+import { MAX_NAME_LENGTH, MAX_NOTE_LENGTH, cleanText } from '@/utils/validation';
+import { parseSharePayload } from '@/utils/shareTarget';
+import { formatCurrency, toLocalDateTimeInputValue } from '@/utils/formatters';
+import { Button } from '@/components/ui/button';
+import { DateTimePicker } from '@/components/ui/date-time-picker';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { NumberPad } from '@/components/ui/number-pad';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import type { Account, CategoryRule, Transaction, TransactionType } from '@/types';
+import { ACCOUNT_TYPE_LABEL } from '@/components/accounts/note';
+import Main from '@/components/ui/main';
+import Header from '@/components/ui/header';
+import { HeaderIconButton, HeaderIconSpacer } from '@/components/ui/header-icon-button';
+
+/** Distinct, trimmed, non-empty values of one transaction field — feeds a field's datalist. */
+function distinctValues(
+  transactions: Transaction[],
+  pick: (t: Transaction) => string | undefined,
+): string[] {
+  const seen = new Set<string>();
+  return transactions
+    .map((t) => pick(t)?.trim())
+    .filter((n): n is string => !!n && !seen.has(n) && seen.add(n) !== undefined);
+}
+
+export default function AddTransaction() {
+  const navigate = useNavigate();
+  const { id } = useParams();
+  const [searchParams] = useSearchParams();
+  const transactions = useFinanceStore((s) => s.transactions);
+  const accounts = useFinanceStore((s) => s.accounts);
+  const hideAmounts = useFinanceStore((s) => s.settings.hideAmounts);
+  const categories = useFinanceStore((s) => s.categories);
+  const labels = useFinanceStore((s) => s.labels);
+  const rules = useFinanceStore((s) => s.rules);
+  const addTransaction = useFinanceStore((s) => s.addTransaction);
+  const updateTransaction = useFinanceStore((s) => s.updateTransaction);
+  const deleteTransaction = useFinanceStore((s) => s.deleteTransaction);
+  const restoreTransaction = useFinanceStore((s) => s.restoreTransaction);
+
+  const existing = id ? transactions.find((t) => t.id === id) : null;
+
+  /**
+   * A draft handed to us by the OS: the Web Share Target (`/share-target?title=&text=&url=`) or
+   * a manifest shortcut (`/add-transaction?type=expense`). Only ever consumed by the `useState`
+   * initializers below, so it seeds a blank form and can never overwrite something typed.
+   * `existing` is always null on both of those routes, but the guard makes that explicit.
+   */
+  const shared = useMemo(
+    () =>
+      existing
+        ? null
+        : parseSharePayload({
+            title: searchParams.get('title'),
+            text: searchParams.get('text'),
+            url: searchParams.get('url'),
+            type: searchParams.get('type'),
+          }),
+    [existing, searchParams],
+  );
+
+  /**
+   * Auto-categorize the shared note up front rather than in a mount effect: `setNote` alone
+   * does not run rules (that lives in `applyRulesToNote`, which can't be called during render),
+   * and seeding `appliedRule` below means the existing "filed by your rule / Undo" banner shows
+   * up — so a shared transaction gets the same visible, reversible treatment as a typed one.
+   */
+  const sharedRule = useMemo(
+    () => (shared?.note ? findMatchingRule(rules, shared.note, shared.type) : undefined),
+    [rules, shared],
+  );
+
+  const [type, setType] = useState<TransactionType>(existing?.type ?? shared?.type ?? 'expense');
+  const [amount, setAmount] = useState(existing?.amount?.toString() ?? shared?.amount ?? '');
+  const [accountId, setAccountId] = useState(
+    existing?.accountId ??
+      accounts.find((a) => !a.archivedAt && a.type !== 'fd' && a.type !== 'rd')?.id ??
+      '',
+  );
+  const [toAccountId, setToAccountId] = useState(existing?.toAccountId ?? '');
+  const [categoryId, setCategoryId] = useState(
+    existing?.categoryId ?? sharedRule?.categoryId ?? '',
+  );
+  const [date, setDate] = useState(
+    existing?.date
+      ? toLocalDateTimeInputValue(existing.date)
+      : toLocalDateTimeInputValue(new Date()),
+  );
+  const [note, setNote] = useState(existing?.note ?? shared?.note ?? '');
+  const [merchant, setMerchant] = useState(existing?.merchant ?? '');
+  const [selectedLabels, setSelectedLabels] = useState<string[]>(
+    existing?.labels ?? mergeLabels([], sharedRule?.labelIds ?? []),
+  );
+
+  const [splitMode, setSplitMode] = useState(!!existing?.splits?.length);
+  const [splitRows, setSplitRows] = useState<{ categoryId: string; amount: string }[]>(
+    existing?.splits?.length
+      ? existing.splits.map((s) => ({ categoryId: s.categoryId, amount: s.amount.toString() }))
+      : [
+          { categoryId: '', amount: '' },
+          { categoryId: '', amount: '' },
+        ],
+  );
+
+  /**
+   * Auto-categorization only ever fills a blank the user hasn't filled themselves. Once they
+   * touch the category picker (or dismiss a suggestion) rules stop firing for this form, and
+   * editing an existing transaction never triggers them at all — a saved category is a decision.
+   */
+  const categoryTouched = useRef(false);
+  const [appliedRule, setAppliedRule] = useState<{
+    rule: CategoryRule;
+    prevCategoryId: string;
+    prevLabels: string[];
+  } | null>(
+    // A rule seeded from a shared note starts from a blank baseline, so editing the note backs
+    // it out to an empty category exactly as if the user had typed the note themselves.
+    sharedRule ? { rule: sharedRule, prevCategoryId: '', prevLabels: [] } : null,
+  );
+
+  /**
+   * A cold start from a manifest shortcut, a share or a notification has nothing behind it in
+   * the history stack, and `navigate(-1)` there drops the user straight out of the PWA. React
+   * Router stamps `history.state.idx`, and 0 means this is the first entry.
+   */
+  const goBack = useCallback(() => {
+    const idx = (window.history.state as { idx?: number } | null)?.idx;
+    if (typeof idx === 'number' && idx > 0) navigate(-1);
+    else navigate('/', { replace: true });
+  }, [navigate]);
+
+  /**
+   * `categoryCleared` means the caller has just wiped the category (a type switch made it
+   * invalid), so the closure's `categoryId` is stale: the baseline is blank, and a rule that
+   * matched before must be re-evaluated rather than assumed still in force.
+   */
+  const applyRulesToNote = (
+    value: string,
+    txType: TransactionType,
+    splitting: boolean,
+    categoryCleared = false,
+  ) => {
+    if (existing || categoryTouched.current || (txType === 'expense' && splitting)) return;
+
+    const rule = findMatchingRule(rules, value, txType);
+    if (!categoryCleared && rule && appliedRule?.rule.id === rule.id) return;
+
+    // Baseline is whatever the user had before *any* rule touched the form, so re-matching a
+    // different rule (or matching nothing) never compounds an earlier rule's edits.
+    const baseCategoryId = categoryCleared
+      ? ''
+      : appliedRule
+        ? appliedRule.prevCategoryId
+        : categoryId;
+    const baseLabels = appliedRule ? appliedRule.prevLabels : selectedLabels;
+
+    if (!rule) {
+      // The note no longer matches — back out, rather than leaving behind a category the
+      // user never chose.
+      if (!appliedRule) return;
+      setCategoryId(baseCategoryId);
+      setSelectedLabels(baseLabels);
+      setAppliedRule(null);
+      return;
+    }
+
+    setCategoryId(rule.categoryId);
+    setSelectedLabels(mergeLabels(baseLabels, rule.labelIds));
+    setAppliedRule({ rule, prevCategoryId: baseCategoryId, prevLabels: baseLabels });
+  };
+
+  const handleNoteChange = (value: string) => {
+    setNote(value);
+    applyRulesToNote(value, type, splitMode);
+  };
+
+  const handleTypeChange = (next: TransactionType) => {
+    if (next === type) return;
+    setType(next);
+
+    // The picker hides categories of the other type, but state would still hold the old id and
+    // save it. Clear anything the new type can't take — and settle which rule (if any) still
+    // applies from that clean baseline.
+    const isValid = (id: string) => {
+      const cat = categories.find((c) => c.id === id);
+      return !!cat && isCategoryValidForType(cat, next);
+    };
+    const staleCategory = !!categoryId && !isValid(categoryId);
+    if (staleCategory) setCategoryId('');
+    if (splitRows.some((r) => r.categoryId && !isValid(r.categoryId))) {
+      setSplitRows((prev) =>
+        prev.map((r) => (r.categoryId && !isValid(r.categoryId) ? { ...r, categoryId: '' } : r)),
+      );
+    }
+    // A rule is scoped to expense or income, so switching type can change which one wins.
+    applyRulesToNote(note, next, splitMode, staleCategory);
+    // No rule re-filed it: a leftover banner's Undo would restore a category of the old type.
+    if (staleCategory && appliedRule && !findMatchingRule(rules, note, next)) setAppliedRule(null);
+  };
+
+  const dismissAppliedRule = () => {
+    if (!appliedRule) return;
+    setCategoryId(appliedRule.prevCategoryId);
+    setSelectedLabels(appliedRule.prevLabels);
+    setAppliedRule(null);
+    categoryTouched.current = true;
+  };
+
+  const chooseCategory = (id: string) => {
+    categoryTouched.current = true;
+    setAppliedRule(null);
+    setCategoryId(id);
+  };
+
+  const notesSuggestions = useMemo(
+    () => distinctValues(transactions, (t) => t.note),
+    [transactions],
+  );
+  const merchantSuggestions = useMemo(
+    () => distinctValues(transactions, (t) => t.merchant),
+    [transactions],
+  );
+
+  // Archived accounts and FD/RD deposits are hidden from the picker, but an existing transaction may already sit
+  // on one — keep that account selectable so editing the row cannot silently reassign it.
+  const selectableAccounts = useMemo(() => {
+    const inUse = new Set([existing?.accountId, existing?.toAccountId].filter(Boolean));
+    // Fixed and recurring deposits are funded and paid out by the deposit flow, never by hand.
+    return accounts.filter(
+      (a) => inUse.has(a.id) || (!a.archivedAt && a.type !== 'fd' && a.type !== 'rd'),
+    );
+  }, [accounts, existing?.accountId, existing?.toAccountId]);
+
+  const filteredCategories = useMemo(
+    () => miscLast(categories.filter((c) => isCategoryValidForType(c, type))),
+    [categories, type],
+  );
+
+  const useSplits = type === 'expense' && splitMode;
+  const splitTotal = splitRows.reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
+  const splitRemaining = roundMoney((parseFloat(amount) || 0) - splitTotal);
+
+  const splitRowIssue = (): string | null => {
+    if (splitRows.some((r) => !r.categoryId)) return 'Pick a category for every split row';
+    if (splitRows.some((r) => !r.amount.trim() || Number.isNaN(parseFloat(r.amount))))
+      return 'Enter an amount for every split row';
+    if (splitRows.some((r) => parseFloat(r.amount) <= 0))
+      return 'Split amounts must be greater than zero';
+    return null;
+  };
+  const hasNonPositiveSplit = splitRows.some(
+    (r) => r.amount.trim() !== '' && parseFloat(r.amount) <= 0,
+  );
+
+  const updateSplitRow = (idx: number, patch: Partial<{ categoryId: string; amount: string }>) => {
+    setSplitRows((prev) => prev.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  };
+
+  const handleAddSplitRow = () => {
+    setSplitRows((prev) => [...prev, { categoryId: '', amount: '' }]);
+  };
+
+  const handleRemoveSplitRow = (idx: number) => {
+    if (splitRows.length <= 2) {
+      // Down to one row is just an unsplit category — fold back to the plain picker.
+      const keep = splitRows[idx === 0 ? 1 : 0];
+      setCategoryId(keep?.categoryId ?? '');
+      setSplitRows([
+        { categoryId: '', amount: '' },
+        { categoryId: '', amount: '' },
+      ]);
+      setSplitMode(false);
+      return;
+    }
+    setSplitRows((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const toggleSplitMode = () => {
+    // Either direction is the user taking charge of the category — a rule has no business
+    // flattening a split, or re-firing once they fold one back down.
+    categoryTouched.current = true;
+    setAppliedRule(null);
+    if (splitMode) {
+      const first = splitRows.find((r) => r.categoryId);
+      if (first) setCategoryId(first.categoryId);
+      setSplitMode(false);
+    } else {
+      setSplitRows((prev) =>
+        prev.some((r) => r.categoryId || r.amount)
+          ? prev
+          : [
+              { categoryId, amount: '' },
+              { categoryId: '', amount: '' },
+            ],
+      );
+      setSplitMode(true);
+    }
+  };
+
+  const submitting = useRef(false);
+
+  const handleSubmit = () => {
+    if (submitting.current) return;
+    const parsedAmount = parseFloat(amount);
+    if (!parsedAmount || parsedAmount <= 0) {
+      toast.error('Enter an amount');
+      return;
+    }
+    if (!accountId) {
+      toast.error('Select an account');
+      return;
+    }
+    if (type === 'transfer') {
+      if (!toAccountId) {
+        toast.error('Select a destination account');
+        return;
+      }
+      if (toAccountId === accountId) {
+        toast.error('Source and destination must differ');
+        return;
+      }
+    } else if (useSplits) {
+      const issue = splitRowIssue();
+      if (issue) {
+        toast.error(issue);
+        return;
+      }
+      if (Math.abs(splitRemaining) > 0.01) {
+        toast.error(
+          splitRemaining > 0
+            ? `${formatCurrency(splitRemaining, false, hideAmounts)} left to allocate`
+            : `${formatCurrency(-splitRemaining, false, hideAmounts)} over the total`,
+        );
+        return;
+      }
+    } else if (!categoryId || !filteredCategories.some((c) => c.id === categoryId)) {
+      toast.error('Select a category');
+      return;
+    }
+
+    submitting.current = true;
+    const transferCategory = findTransferCategory(categories);
+    const txData = {
+      type,
+      amount: parsedAmount,
+      accountId,
+      toAccountId: type === 'transfer' ? toAccountId : undefined,
+      categoryId:
+        type === 'transfer'
+          ? (transferCategory?.id ?? categoryId ?? '')
+          : useSplits
+            ? ''
+            : categoryId,
+      date: new Date(date).toISOString(),
+      note: cleanText(note, MAX_NOTE_LENGTH),
+      // `undefined` (not '') when blank, so an edit clears the field and old rows stay unchanged.
+      merchant: cleanText(merchant, MAX_NAME_LENGTH) || undefined,
+      labels: selectedLabels,
+      splits: useSplits
+        ? splitRows.map((r) => ({
+            categoryId: r.categoryId,
+            amount: roundMoney(parseFloat(r.amount)),
+          }))
+        : undefined,
+    };
+
+    if (existing) {
+      updateTransaction(existing.id, txData);
+      toast.success('Transaction updated');
+    } else {
+      addTransaction(txData);
+      toast.success('Transaction added');
+    }
+    goBack();
+  };
+
+  const handleDelete = () => {
+    if (!existing) return;
+    // Cheap and fully reversible, so undo beats a confirm prompt here.
+    const removed = deleteTransaction(existing.id);
+    if (!removed) return;
+    goBack();
+    toast.success('Transaction deleted', {
+      action: { label: 'Undo', onClick: () => restoreTransaction(removed) },
+    });
+  };
+
+  const toggleLabel = (labelId: string) => {
+    setSelectedLabels((prev) =>
+      prev.includes(labelId) ? prev.filter((l) => l !== labelId) : [...prev, labelId],
+    );
+  };
+
+  return (
+    <>
+      {/* Header */}
+      <Header innerClassName="lg:max-w-xl">
+        <HeaderIconButton onClick={goBack} aria-label="Back">
+          <ArrowLeft />
+        </HeaderIconButton>
+        <h1 className="text-base font-semibold">
+          {existing ? 'Edit transaction' : 'Add transaction'}
+        </h1>
+        {existing ? (
+          <HeaderIconButton onClick={handleDelete} aria-label="Delete" tone="destructive">
+            <Trash2 />
+          </HeaderIconButton>
+        ) : (
+          <HeaderIconSpacer />
+        )}
+      </Header>
+
+      <Main className="lg:max-w-xl lg:pb-28">
+        {/* Type selector — one lavender selected state for every type. */}
+        <div
+          className="bg-muted grid grid-cols-3 gap-1 rounded-full p-1"
+          role="group"
+          aria-label="Type"
+        >
+          {(['expense', 'income', 'transfer'] as const).map((t) => {
+            const isActive = type === t;
+            return (
+              <button
+                key={t}
+                type="button"
+                onClick={() => handleTypeChange(t)}
+                aria-pressed={isActive}
+                className={`rounded-full py-2 text-sm font-medium capitalize transition-all ${
+                  isActive
+                    ? 'bg-grad-primary shadow-glow-primary text-white'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {t}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Amount */}
+        <div>
+          <Label className="text-muted-foreground mb-1.5 block text-xs font-medium">Amount</Label>
+          <NumberPad value={amount} onChange={setAmount} />
+        </div>
+
+        {/* Account */}
+        <div>
+          <Label className="text-muted-foreground mb-1.5 block text-xs font-medium">
+            {type === 'transfer' ? 'From account' : 'Account'}
+          </Label>
+          <Select value={accountId} onValueChange={(v) => setAccountId(v ?? '')}>
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="Select account">
+                {accountOption(accounts.find((a) => a.id === accountId))}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {selectableAccounts.map((a) => (
+                <SelectItem key={a.id} value={a.id}>
+                  {accountOption(a)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {selectableAccounts.length === 0 && (
+            <p className="bg-warning-band text-warning-band-foreground mt-2 rounded-md p-3 text-xs">
+              You need an account before you can record a transaction.{' '}
+              <button
+                type="button"
+                onClick={() => navigate('/add-account')}
+                className="font-medium underline"
+              >
+                Add an account
+              </button>
+            </p>
+          )}
+        </div>
+
+        {/* To Account (Transfer) */}
+        {type === 'transfer' && (
+          <div>
+            <Label className="text-muted-foreground mb-1.5 block text-xs font-medium">
+              To account
+            </Label>
+            <Select value={toAccountId} onValueChange={(v) => setToAccountId(v ?? '')}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Select account">
+                  {accountOption(accounts.find((a) => a.id === toAccountId))}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {selectableAccounts
+                  .filter((a) => a.id !== accountId)
+                  .map((a) => (
+                    <SelectItem key={a.id} value={a.id}>
+                      {accountOption(a)}
+                    </SelectItem>
+                  ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+
+        {/* Category */}
+        {type !== 'transfer' && (
+          <div>
+            <div className="mb-1.5 flex items-center justify-between">
+              <Label className="text-muted-foreground block text-xs font-medium">Category</Label>
+              {type === 'expense' && (
+                <button
+                  type="button"
+                  onClick={toggleSplitMode}
+                  aria-pressed={splitMode}
+                  className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition-all ${
+                    splitMode
+                      ? 'bg-grad-primary shadow-glow-primary text-white'
+                      : 'bg-muted text-muted-foreground'
+                  }`}
+                >
+                  <Split size={12} /> Split
+                </button>
+              )}
+            </div>
+
+            {splitMode ? (
+              <div className="space-y-2">
+                {splitRows.map((row, idx) => (
+                  <div key={idx} className="flex items-center gap-2">
+                    <Select
+                      value={row.categoryId}
+                      onValueChange={(v) => updateSplitRow(idx, { categoryId: v ?? '' })}
+                    >
+                      <SelectTrigger className="min-w-0 flex-1">
+                        <SelectValue placeholder="Category">
+                          {filteredCategories.find((c) => c.id === row.categoryId)?.name}
+                        </SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {filteredCategories.map((c) => (
+                          <SelectItem key={c.id} value={c.id}>
+                            {c.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Input
+                      type="number"
+                      inputMode="decimal"
+                      placeholder="Amount"
+                      min="0.01"
+                      step="0.01"
+                      value={row.amount}
+                      onChange={(e) => updateSplitRow(idx, { amount: e.target.value })}
+                      aria-label={`Split ${idx + 1} amount`}
+                      className="w-24 shrink-0 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveSplitRow(idx)}
+                      className="text-muted-foreground hover:text-destructive shrink-0 p-1"
+                      aria-label="Remove split"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={handleAddSplitRow}
+                  className="text-primary flex items-center gap-1 text-xs font-medium"
+                >
+                  <Plus size={14} /> Add split
+                </button>
+                <p
+                  className={`text-xs ${
+                    Math.abs(splitRemaining) < 0.01 && !hasNonPositiveSplit
+                      ? 'text-muted-foreground'
+                      : 'text-destructive'
+                  }`}
+                >
+                  {hasNonPositiveSplit
+                    ? 'Split amounts must be greater than zero'
+                    : Math.abs(splitRemaining) < 0.01
+                      ? 'Fully allocated'
+                      : splitRemaining > 0
+                        ? `${formatCurrency(splitRemaining, false, hideAmounts)} left to allocate`
+                        : `${formatCurrency(-splitRemaining, false, hideAmounts)} over the total`}
+                </p>
+              </div>
+            ) : (
+              <CategoryGrid>
+                {filteredCategories.map((cat) => {
+                  const selected = categoryId === cat.id;
+                  return (
+                    <button
+                      key={cat.id}
+                      data-selected={selected}
+                      onClick={() => chooseCategory(cat.id)}
+                      className={`flex flex-col items-center gap-1 rounded-sm border p-2 text-center transition-all ${
+                        selected
+                          ? 'ring-grad-primary border-transparent'
+                          : 'border-border bg-card hover:bg-muted'
+                      }`}
+                      style={selected ? { backgroundColor: `${cat.color}22` } : undefined}
+                    >
+                      <div
+                        className="flex h-8 w-8 items-center justify-center rounded-full"
+                        style={{ backgroundColor: cat.color }}
+                      >
+                        <CategoryIcon icon={cat.icon} size={16} color="white" />
+                      </div>
+                      <span className="line-clamp-2 text-[10px] leading-tight">{cat.name}</span>
+                    </button>
+                  );
+                })}
+              </CategoryGrid>
+            )}
+          </div>
+        )}
+
+        {/* Date */}
+        <div>
+          <Label className="text-muted-foreground mb-1.5 block text-xs font-medium">
+            Date & time
+          </Label>
+          <DateTimePicker value={date} onChange={setDate} />
+        </div>
+
+        {/* Merchant */}
+        <div>
+          <Label className="text-muted-foreground mb-1.5 block text-xs font-medium">Merchant</Label>
+          <Input
+            type="text"
+            placeholder="Who was it with..."
+            value={merchant}
+            maxLength={MAX_NAME_LENGTH}
+            onChange={(e) => setMerchant(e.target.value)}
+            list="merchant-suggestions"
+            className="[&::-webkit-calendar-picker-indicator]:hidden! [&::-webkit-list-button]:hidden!"
+          />
+          <datalist id="merchant-suggestions">
+            {merchantSuggestions.map((n) => (
+              <option key={n} value={n} />
+            ))}
+          </datalist>
+        </div>
+
+        {/* Note */}
+        <div>
+          <Label className="text-muted-foreground mb-1.5 block text-xs font-medium">Note</Label>
+          <Input
+            type="text"
+            placeholder="Add a note..."
+            value={note}
+            maxLength={MAX_NOTE_LENGTH}
+            onChange={(e) => handleNoteChange(e.target.value)}
+            list="note-suggestions"
+            className="[&::-webkit-calendar-picker-indicator]:hidden! [&::-webkit-list-button]:hidden!"
+          />
+          <datalist id="note-suggestions">
+            {notesSuggestions.map((n) => (
+              <option key={n} value={n} />
+            ))}
+          </datalist>
+          {appliedRule && (
+            <div className="text-primary mt-1.5 flex items-center gap-1.5 text-xs">
+              <Wand2 size={12} className="shrink-0" />
+              <span className="min-w-0 flex-1 truncate">
+                Filed as {categories.find((c) => c.id === appliedRule.rule.categoryId)?.name} by
+                your "{appliedRule.rule.pattern}" rule
+              </span>
+              <button
+                type="button"
+                onClick={dismissAppliedRule}
+                className="text-muted-foreground shrink-0 underline"
+              >
+                Undo
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Labels */}
+        {labels.length > 0 && (
+          <div>
+            <Label className="text-muted-foreground mb-1.5 block text-xs font-medium">Labels</Label>
+            <div className="flex flex-wrap gap-2">
+              {labels.map((label) => {
+                const active = selectedLabels.includes(label.id);
+                return (
+                  <button
+                    key={label.id}
+                    type="button"
+                    onClick={() => toggleLabel(label.id)}
+                    aria-pressed={active}
+                    className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-all ${
+                      active
+                        ? 'text-foreground'
+                        : 'bg-muted text-muted-foreground border-transparent'
+                    }`}
+                    // Selected: a soft tint of the label's own colour with ink text, so a light
+                    // user colour (yellow, mint) stays readable.
+                    style={
+                      active
+                        ? {
+                            backgroundColor: `color-mix(in srgb, ${label.color} 18%, transparent)`,
+                            borderColor: label.color,
+                          }
+                        : undefined
+                    }
+                  >
+                    <span
+                      className="size-2 shrink-0 rounded-full"
+                      style={{ backgroundColor: label.color }}
+                      aria-hidden="true"
+                    />
+                    {label.name}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Submit */}
+        {/* Glass bar spans the content column (after the desktop sidebar); the button keeps
+            to the form's own width. */}
+        <div className="glass-chrome fixed right-0 bottom-0 left-0 z-50 border-t border-[var(--glass-border)] px-3 pt-3 pb-[calc(env(safe-area-inset-bottom,0px)+0.75rem)] lg:left-60">
+          <Button onClick={handleSubmit} className="mx-auto flex w-full max-w-lg" size="lg">
+            {existing ? 'Update transaction' : 'Add transaction'}
+          </Button>
+        </div>
+      </Main>
+    </>
+  );
+}
+
+/** An account in a picker: its name plus its human type name ("Credit card"), muted. */
+function accountOption(account: Account | undefined) {
+  if (!account) return null;
+  return (
+    <span className="flex min-w-0 items-center gap-1.5">
+      <span className="truncate">{account.name}</span>
+      <span className="text-muted-foreground shrink-0 text-xs">
+        {ACCOUNT_TYPE_LABEL[account.type] ?? account.type}
+      </span>
+    </span>
+  );
+}

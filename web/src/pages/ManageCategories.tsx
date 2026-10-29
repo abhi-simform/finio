@@ -1,0 +1,279 @@
+import { useState } from 'react';
+import { useNavigate } from 'react-router';
+import { ArrowLeft, Lock, Plus, Trash2, Pencil } from 'lucide-react';
+import { toast } from 'sonner';
+import { CategoryIcon, CATEGORY_ICONS } from '@/components/categories/CategoryIcon';
+import { isProtectedCategory, useFinanceStore } from '@/store/useFinanceStore';
+import { COLOR_PALETTE } from '@/data/colorPalette';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { useConfirm } from '@/components/ui/use-confirm';
+import type { CategoryType } from '@/types';
+import Header from '@/components/ui/header';
+import { HeaderIconButton } from '@/components/ui/header-icon-button';
+import Main from '@/components/ui/main';
+import { TRANSFER_CATEGORY_ID, miscLast } from '@/utils/calculations';
+import { MAX_NAME_LENGTH, cleanText, stripLeading } from '@/utils/validation';
+
+const categoryColors = COLOR_PALETTE;
+
+export default function ManageCategories() {
+  const navigate = useNavigate();
+  const confirm = useConfirm();
+  const categories = useFinanceStore((s) => s.categories);
+  const addCategory = useFinanceStore((s) => s.addCategory);
+  const updateCategory = useFinanceStore((s) => s.updateCategory);
+  const deleteCategory = useFinanceStore((s) => s.deleteCategory);
+
+  const [open, setOpen] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [name, setName] = useState('');
+  const [type, setType] = useState<CategoryType>('expense');
+  const [color, setColor] = useState(categoryColors[0]);
+  const [icon, setIcon] = useState('circle-ellipsis');
+
+  const [filter, setFilter] = useState<'all' | CategoryType>('all');
+
+  const filtered =
+    filter === 'all'
+      ? miscLast(categories)
+      : miscLast(categories.filter((c) => c.type === filter || c.type === 'both'));
+
+  const handleEdit = (id: string) => {
+    const cat = categories.find((c) => c.id === id);
+    if (!cat) return;
+    setEditId(id);
+    setName(cat.name);
+    setType(cat.type);
+    setColor(cat.color);
+    setIcon(cat.icon);
+    setOpen(true);
+  };
+
+  const handleSubmit = () => {
+    const cleanName = cleanText(name, MAX_NAME_LENGTH);
+    if (!cleanName) {
+      toast.error('Enter a name');
+      return;
+    }
+    const key = cleanName.toLowerCase();
+    if (
+      categories.some(
+        (c) => c.id !== editId && c.type === type && c.name.trim().toLowerCase() === key,
+      )
+    ) {
+      toast.error(`A ${type} category named "${cleanName}" already exists`);
+      return;
+    }
+    if (editId) {
+      updateCategory(editId, { name: cleanName, type, color, icon });
+      toast.success('Category updated');
+    } else {
+      addCategory({ name: cleanName, type, color, icon });
+      toast.success('Category added');
+    }
+    resetForm();
+  };
+
+  const resetForm = () => {
+    setOpen(false);
+    setEditId(null);
+    setName('');
+    setType('expense');
+    setColor(categoryColors[0]);
+    setIcon('circle-ellipsis');
+  };
+
+  return (
+    <>
+      {/* Header */}
+      <Header innerClassName="lg:max-w-xl">
+        <HeaderIconButton onClick={() => navigate(-1)} aria-label="Back">
+          <ArrowLeft />
+        </HeaderIconButton>
+        <h1 className="text-base font-semibold">Categories</h1>
+        <HeaderIconButton
+          onClick={() => {
+            resetForm();
+            setOpen(true);
+          }}
+          aria-label="Add category"
+          tone="primary"
+        >
+          <Plus />
+        </HeaderIconButton>
+      </Header>
+
+      <Main className="lg:max-w-xl">
+        {/* Filter */}
+        <div className="flex gap-2">
+          {(['all', 'expense', 'income', 'both'] as const).map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              aria-pressed={filter === f}
+              className={`rounded-full px-3 py-1.5 text-xs font-medium capitalize ${
+                filter === f
+                  ? 'bg-grad-primary shadow-glow-primary text-white'
+                  : 'bg-muted text-muted-foreground'
+              }`}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+
+        {/* Form Dialog */}
+        <Dialog
+          open={open}
+          onOpenChange={(v) => {
+            if (!v) resetForm();
+          }}
+        >
+          <DialogContent className="bg-card mx-auto w-11/12">
+            <DialogHeader>
+              <DialogTitle>{editId ? 'Edit category' : 'Add category'}</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-3">
+              <Input
+                type="text"
+                placeholder="Category name"
+                value={name}
+                maxLength={MAX_NAME_LENGTH}
+                onChange={(e) => setName(stripLeading(e.target.value))}
+              />
+              <div className="flex gap-2">
+                {(['expense', 'income', 'both'] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setType(t)}
+                    aria-pressed={type === t}
+                    className={`rounded-full px-3 py-1.5 text-xs font-medium capitalize ${
+                      type === t
+                        ? 'bg-grad-primary shadow-glow-primary text-white'
+                        : 'bg-muted text-muted-foreground'
+                    }`}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+              <div>
+                <Label className="text-muted-foreground mb-1.5 block text-xs font-medium">
+                  Icon
+                </Label>
+                <div className="grid h-50 grid-cols-6 gap-2 overflow-auto">
+                  {CATEGORY_ICONS.map((i) => (
+                    <button
+                      key={i}
+                      onClick={() => setIcon(i)}
+                      className={`flex h-9 items-center justify-center rounded-full border transition-colors ${
+                        icon === i ? 'border-primary bg-primary/10' : 'border-border bg-card'
+                      }`}
+                      aria-label={`Icon ${i}`}
+                      aria-pressed={icon === i}
+                    >
+                      <CategoryIcon icon={i} size={16} />
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <Label className="text-muted-foreground mb-1.5 block text-xs font-medium">
+                  Color
+                </Label>
+                <div className="flex flex-wrap gap-2">
+                  {categoryColors.map((c) => (
+                    <button
+                      key={c}
+                      onClick={() => setColor(c)}
+                      className={`h-7 w-7 rounded-full ${color === c ? 'ring-primary scale-110 ring-2 ring-offset-2' : ''}`}
+                      style={{ backgroundColor: c }}
+                      aria-label={`Color ${c}`}
+                      aria-pressed={color === c}
+                    />
+                  ))}
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <Button onClick={handleSubmit} className="flex-1">
+                  {editId ? 'Update' : 'Add'}
+                </Button>
+                <Button variant="secondary" onClick={resetForm}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        {/* List */}
+        <div className="card-elevated divide-border divide-y rounded-md px-4">
+          {filtered.map((cat) => {
+            const isProtected = isProtectedCategory(cat.id);
+            return (
+              <div key={cat.id} className="flex items-center justify-between gap-3 py-3">
+                <div className="flex min-w-0 items-center gap-3">
+                  <span aria-hidden className="flex shrink-0">
+                    <CategoryIcon icon={cat.icon} size={16} color={cat.color} />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">{cat.name}</p>
+                    <p className="text-muted-foreground text-xs">
+                      <span className="capitalize">{cat.type}</span>
+                      {isProtected &&
+                        (cat.id === TRANSFER_CATEGORY_ID
+                          ? ' · Built in, used by every transfer'
+                          : ' · Built in, the catch-all for deleted categories')}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex shrink-0 gap-1">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => handleEdit(cat.id)}
+                    className="h-8 w-8"
+                    aria-label={`Edit ${cat.name}`}
+                  >
+                    <Pencil size={14} className="text-muted-foreground" />
+                  </Button>
+                  {isProtected ? (
+                    <span
+                      className="text-muted-foreground flex h-8 w-8 items-center justify-center"
+                      title={`${cat.name} is built in and can't be deleted`}
+                      aria-label={`${cat.name} is built in and can't be deleted`}
+                      role="img"
+                    >
+                      <Lock size={14} />
+                    </span>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label={`Delete ${cat.name}`}
+                      onClick={async () => {
+                        const confirmed = await confirm({
+                          title: `Delete "${cat.name}"?`,
+                          description:
+                            'Transactions and recurring rules using it move to Miscellaneous, and any budget for it is removed.',
+                          confirmLabel: 'Delete category',
+                        });
+                        if (confirmed) deleteCategory(cat.id);
+                      }}
+                      className="h-8 w-8"
+                    >
+                      <Trash2 size={14} className="text-destructive" />
+                    </Button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Main>
+    </>
+  );
+}

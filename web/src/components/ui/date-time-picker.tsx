@@ -1,0 +1,97 @@
+import * as React from 'react';
+import { format } from 'date-fns';
+import { CalendarIcon } from 'lucide-react';
+
+import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Calendar } from '@/components/ui/calendar';
+import { Input } from '@/components/ui/input';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { formatShortDate } from '@/utils/formatters';
+import { formatDateTimeLocal, parseDateTimeLocal } from './date-time-picker-utils';
+
+export interface DateTimePickerProps {
+  /** Value formatted like `<input type="datetime-local">` (e.g., "2026-05-27T14:30"). */
+  value: string;
+  onChange: (value: string) => void;
+  /** Wrapper class — for layout/spacing of the picker as a whole. */
+  className?: string;
+  /**
+   * Class applied to both the date trigger and the time input so the picker
+   * matches surrounding form fields (height, background, radius, etc.).
+   * Defaults to the app's standard "big" form style.
+   */
+  inputClassName?: string;
+  placeholder?: string;
+  disabled?: boolean;
+}
+
+const DEFAULT_INPUT_CLASS = '';
+
+export function DateTimePicker({
+  value,
+  onChange,
+  className,
+  inputClassName = DEFAULT_INPUT_CLASS,
+  placeholder = 'Pick a date',
+  disabled,
+}: DateTimePickerProps) {
+  const [open, setOpen] = React.useState(false);
+  const date = parseDateTimeLocal(value);
+  const timeValue = date ? format(date, 'HH:mm') : '';
+
+  const handleDateSelect = (selected: Date | undefined) => {
+    if (!selected) return;
+    const base = date ?? new Date();
+    const next = new Date(selected);
+    next.setHours(base.getHours(), base.getMinutes(), 0, 0);
+    onChange(formatDateTimeLocal(next));
+    setOpen(false);
+  };
+
+  const handleTimeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const next = e.target.value; // "HH:mm"
+    const [hStr, mStr] = next.split(':');
+    const h = Number(hStr);
+    const m = Number(mStr);
+    if (Number.isNaN(h) || Number.isNaN(m)) return;
+    const base = date ?? new Date();
+    const updated = new Date(base);
+    updated.setHours(h, m, 0, 0);
+    onChange(formatDateTimeLocal(updated));
+  };
+
+  return (
+    <div className={cn('flex gap-2', className)}>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger
+          render={
+            <Button
+              variant="outline"
+              disabled={disabled}
+              className={cn(
+                'border-input bg-card hover:bg-card h-10 flex-1 justify-start rounded-sm px-3 py-1 text-left text-base font-normal md:text-sm',
+                inputClassName,
+                !date && 'text-muted-foreground',
+              )}
+            >
+              <CalendarIcon className="mr-2 size-4 shrink-0" />
+              {date ? formatShortDate(date) : <span>{placeholder}</span>}
+            </Button>
+          }
+        />
+        <PopoverContent align="start" className="w-auto p-0">
+          <Calendar mode="single" selected={date ?? undefined} onSelect={handleDateSelect} />
+        </PopoverContent>
+      </Popover>
+      <Input
+        type="time"
+        value={timeValue}
+        onChange={handleTimeChange}
+        disabled={disabled || !date}
+        aria-label="Time"
+        className={cn('w-28', inputClassName)}
+      />
+    </div>
+  );
+}
